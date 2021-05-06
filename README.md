@@ -1,0 +1,1 @@
+# go-check-err-chains
