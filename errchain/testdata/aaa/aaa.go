@@ -11,16 +11,19 @@ type Struct struct{}
 
 func (x *Struct) Method(input string) (int, error) {
 	const fn = pkgName + ".Struct" + ".Method"
-	if len(input) < 3 {
-		return 0, fmt.Errorf("%s: input too short, require longer than %d, input=%q", fn, 3, input)
+	if len(input) < 1 {
+		return 0, fmt.Errorf("%s: input too short, require longer than %d, input=%q", fn, 1, input)
+	}
+	if len(input) < 2 {
+		return 0, fmt.Errorf("aaa.Struct: input too short, require longer than %d, input=%q", 2, input)
 	}
 	if len(input) < 3 {
 		return 0, fmt.Errorf("input too short, require longer than %d, input=%q", 3, input) // want `Error message must point to the place where it had happened. Consider starting message with one of the following strings: "aaa: ", "aaa\.Struct\.Method: ", "aaa\.\(\*Struct\)\.Method: "`
 	}
-	if len(input) == 10 {
+	if len(input) < 4 {
 		return 0, fmt.Errorf("aaa.(*Struct.Method: error") // want `Error message must point to the place where it had happened. Consider starting message with one of the following strings: "aaa: ", "aaa\.Struct\.Method: ", "aaa\.\(\*Struct\)\.Method: "`
 	}
-	if true {
+	if len(input) < 5 {
 		return 0, errors.New("errrrrr") // want `Error message must point to the place where it had happened. Consider starting message with one of the following strings: "aaa: ", "aaa\.Struct\.Method: ", "aaa\.\(\*Struct\)\.Method: "`
 	}
 

@@ -58,6 +58,7 @@ func Get(key string) error {
 - plugin.Open("file.so"): realpath failed
 - bytes.Buffer: too large
 - open file.go: no such file or directory
+- strings.Builder.Grow: negative count
 
 Видно что строгой схемы нет, но паттерн прослеживается: вначале имя пакета/метода/функции, затем двоеточие и далее подробности.
 

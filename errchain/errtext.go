@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 	"strconv"
 	"strings"
@@ -21,13 +22,21 @@ var Analyzer = &analysis.Analyzer{
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 }
 
-const diagnosticMessage = "Error message must point to the place where it had happened. Consider starting message with one of the following strings: "
+const diagnosticMessage = "Error message must point to the place where it had happened"
+const helpURL = "https://bit.ly/err-chains"
+
+// go run -ldflags "-X github.com/iimos/go-check-err-chains/errchain.debug=1" .
+var debug = ""
+
+func isDebug() bool {
+	return debug != ""
+}
 
 func run(pass *analysis.Pass) (interface{}, error) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	nodeFilter := []ast.Node{(*ast.File)(nil)}
 
-	if pass.Pkg.Name() == "main" {
+	if code.IsMainLike(pass) {
 		return nil, nil
 	}
 
@@ -83,13 +92,15 @@ func errorPrefixes(pkg *types.Package, fn *ast.FuncDecl) []string {
 		if ident, ok := recv.X.(*ast.Ident); ok {
 			pref1 := fmt.Sprintf("%s.%s.%s: ", pkg.Name(), ident.Name, fn.Name.Name)
 			pref2 := fmt.Sprintf("%s.(*%s).%s: ", pkg.Name(), ident.Name, fn.Name.Name)
-			prefixes = append(prefixes, pref1, pref2)
+			pref3 := fmt.Sprintf("%s.%s: ", pkg.Name(), ident.Name)
+			prefixes = append(prefixes, pref1, pref2, pref3)
 		} else {
 			return nil
 		}
 	case *ast.Ident:
-		pref := fmt.Sprintf("%s.%s.%s: ", pkg.Name(), recv.Name, fn.Name.Name)
-		prefixes = append(prefixes, pref)
+		pref1 := fmt.Sprintf("%s.%s.%s: ", pkg.Name(), recv.Name, fn.Name.Name)
+		pref2 := fmt.Sprintf("%s.%s: ", pkg.Name(), recv.Name)
+		prefixes = append(prefixes, pref1, pref2)
 	default:
 		return nil
 	}
@@ -143,74 +154,204 @@ func handleFuncBody(pass *analysis.Pass, parentFunc *ast.FuncDecl, node ast.Node
 		}
 
 		errorMessage := fmt.Sprintf(format, formatArgs...)
-		locationFromText, ok := parseErrorLocation(errorMessage)
+		prefix, err := parsePrefix(errorMessage)
 
-		if !locationFromText.match(pass.Pkg, parentFunc) {
-			msg := strings.Builder{}
-			msg.WriteString(diagnosticMessage)
-			for i, prefix := range errorPrefixes(pass.Pkg, parentFunc) {
-				if i > 0 {
-					msg.WriteString(", ")
-				}
-				msg.WriteString(strconv.Quote(prefix))
+		report := func(err *prefixError) {
+			if isDebug() {
+				fmt.Printf("[DEBUG] errchain: %s(%q); err=%+v\n", callName, errorMessage, err)
 			}
-			// fmt.Printf("[DEBUG] errchain: %s(%q); loc=%#v \n", callName, errorMessage, locationFromText)
-			pass.Reportf(node.Pos(), msg.String())
+			var msg string
+			switch err.errType {
+			case errNoPrefix:
+				recoms := generatePrefixRecomendations(pass, parentFunc)
+				msg = diagnosticMessage + ": " + recoms
+			default:
+				msg = diagnosticMessage + ": " + err.errType.Error()
+			}
+			pass.Reportf(node.Pos(), msg)
+		}
+
+		if err != nil {
+			switch err {
+			case errNoPrefix:
+				report(&prefixError{errType: errNoPrefix})
+				return
+			case errInvalidSyntax:
+				if prefix.match(pass.Pkg, parentFunc) == nil {
+					report(&prefixError{errType: errInvalidSyntax})
+					// todo: report("seems like correct prefix but syntax is wrong")
+					return
+				}
+				report(&prefixError{errType: errNoPrefix})
+				return
+			default:
+				if isDebug() {
+					panic("unexpected error type: " + err.Error())
+				}
+			}
+		}
+
+		if err := prefix.match(pass.Pkg, parentFunc); err != nil {
+			report(err)
 		}
 	}
+}
+
+func generatePrefixRecomendations(pass *analysis.Pass, parentFunc *ast.FuncDecl) string {
+	buf := strings.Builder{}
+	buf.WriteString("Consider starting message with one of the following strings: ")
+	for i, prefix := range errorPrefixes(pass.Pkg, parentFunc) {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(strconv.Quote(prefix))
+	}
+	return buf.String()
 }
 
 type location struct {
-	pkg, recv, fn string
-	isRecvPtr     bool
+	pkg       string
+	recv      string
+	fn        string
+	isRecvPtr bool
 }
 
-func (loc location) match(pkg *types.Package, fn *ast.FuncDecl) bool {
+type errorKind string
+
+func (k errorKind) Error() string {
+	return string(k)
+}
+
+var (
+	errNoPrefix         = errorKind("no prefix found")
+	errPackageMismatch  = errorKind("package name mismatch")
+	errPrefixDuplicate  = errorKind("prefix duplicate")
+	errInvalidSyntax    = errorKind("syntax is wrong")
+	errFuncNotFound     = errorKind("neither func nor struct has been found")
+	errMethodNotFound   = errorKind("method not found")
+	errRecieverNotFound = errorKind("reciever not found")
+	errNoPointer        = errorKind("reciever has no pointer")
+)
+
+type prefixError struct {
+	errType      errorKind
+	got          string
+	expect       string
+	parsedPrefix location
+}
+
+func (loc location) match(pkg *types.Package, fn *ast.FuncDecl) *prefixError {
 	if loc.pkg == "" {
-		return false
+		return &prefixError{errType: errNoPrefix, got: loc.pkg, expect: pkg.Name(), parsedPrefix: loc}
 	}
 
 	if !strings.HasSuffix(pkg.Path(), loc.pkg) {
-		return false
+		return &prefixError{errType: errPackageMismatch, got: loc.pkg, expect: pkg.Name(), parsedPrefix: loc}
 	}
 
-	if loc.fn != "" && fn.Name.Name != loc.fn {
-		return false
+	recieverName, isRecieverPointer := recvString(fn)
+	functionName := fn.Name.Name
+
+	// pkg only
+	if loc.recv == "" && loc.fn == "" {
+		return nil
 	}
 
-	if loc.recv == "" {
-		return true
-	} else {
-		if fn.Recv == nil || len(fn.Recv.List) == 0 {
-			return false
+	// pkg.Func, pkg.Struct, pkg.Method
+	if loc.recv == "" && loc.fn != "" {
+		if loc.fn == recieverName {
+			// pkg.Struct
+			return nil
 		}
+		if loc.fn == functionName {
+			// pkg.Func, pkg.Method
+			return nil
+		}
+		return &prefixError{
+			errType:      errFuncNotFound,
+			got:          loc.fn,
+			expect:       functionName + " or " + recieverName,
+			parsedPrefix: loc,
+		}
+	}
 
-		recvType := fn.Recv.List[0].Type
-
-		if ptr, ok := recvType.(*ast.StarExpr); ok {
-			recvType = ptr.X
-		} else {
-			if !loc.isRecvPtr {
-				return false
+	// pkg.Struct.Method, pkg.(*Struct).Method
+	if loc.recv != "" && loc.fn != "" {
+		if loc.recv == recieverName && loc.fn != functionName {
+			// err: method not found
+			return &prefixError{
+				errType:      errMethodNotFound,
+				got:          loc.fn,
+				expect:       functionName,
+				parsedPrefix: loc,
 			}
 		}
-
-		recv, ok := recvType.(*ast.Ident)
-		if !ok {
-			return false
+		if loc.recv != recieverName && loc.fn == functionName {
+			// err: reciever not found
+			return &prefixError{
+				errType:      errRecieverNotFound,
+				got:          loc.recv,
+				expect:       recieverName,
+				parsedPrefix: loc,
+			}
 		}
-		return recv.Name == loc.recv
+		if loc.recv != recieverName && loc.fn != functionName {
+			// err: method not found
+			return &prefixError{
+				errType:      errMethodNotFound,
+				got:          loc.recv + "." + loc.fn,
+				expect:       recieverName + "." + functionName,
+				parsedPrefix: loc,
+			}
+		}
+		if loc.recv == recieverName && loc.fn == functionName {
+			if loc.isRecvPtr && !isRecieverPointer {
+				// err: reciever has no pointer
+				return &prefixError{
+					errType:      errNoPointer,
+					got:          "(*" + loc.recv + ")",
+					expect:       recieverName,
+					parsedPrefix: loc,
+				}
+			}
+			return nil
+		}
 	}
+
+	// unrechable
+	if isDebug() {
+		panic("imposible")
+	}
+	return nil
 }
 
-func parseErrorLocation(errorMessage string) (loc location, ok bool) {
+// recvString returns a string representation of the functions reciever.
+func recvString(fn *ast.FuncDecl) (recieverName string, isPointer bool) {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return "", false
+	}
+
+	recvType := fn.Recv.List[0].Type
+
+	if star, ok := recvType.(*ast.StarExpr); ok {
+		isPointer = true
+		recvType = star.X
+	}
+
+	if r, ok := recvType.(*ast.Ident); ok {
+		return r.Name, isPointer
+	}
+	return "", false
+}
+
+func parsePrefix(errorMessage string) (loc location, err error) {
 	const sep = ": "
 	i := strings.Index(errorMessage, sep)
 	if i < 0 {
-		return loc, false
+		return loc, errNoPrefix
 	}
 
-	split := strings.Split(errorMessage[:i], ".")
+	split := strings.SplitN(errorMessage[:i], ".", 4)
 	switch len(split) {
 	case 1:
 		loc.pkg = split[0]
@@ -222,17 +363,29 @@ func parseErrorLocation(errorMessage string) (loc location, ok bool) {
 		loc.recv = split[1]
 		loc.fn = split[2]
 	default:
-		return loc, false
+		loc.pkg = split[0]
+		loc.recv = split[1]
+		loc.fn = split[2]
+		return loc, errInvalidSyntax
+	}
+
+	if loc.recv != "" && !token.IsIdentifier(loc.recv) {
+		return loc, errInvalidSyntax
+	}
+	if loc.fn != "" && !token.IsIdentifier(loc.fn) {
+		return loc, errInvalidSyntax
 	}
 
 	if strings.HasPrefix(loc.recv, "(*") {
+		loc.recv = loc.recv[2:]
 		if strings.HasSuffix(loc.recv, ")") {
+			loc.recv = loc.recv[:len(loc.recv)-1]
 			loc.isRecvPtr = true
 		} else {
-			return loc, false
+			return loc, errInvalidSyntax
 		}
 	}
-	return loc, true
+	return loc, nil
 }
 
 func constantValue(pass *analysis.Pass, expr ast.Expr) (interface{}, bool) {
