@@ -1,10 +1,11 @@
 # go-check-err-chains
 
-Линтер проверяет что текст ошибок содержит префикс указывающий на пакет/функцию/метод в котором произошла ошибка.
+The linter checks that the error text contains a prefix indicating the package/function/method where the error occurred. 
 
-Проверка проводится только для экспортируемых функций.
+The check is only performed for exported functions.
 
-Пример:
+Example:
+
 ```go
 package pkg
 
@@ -20,47 +21,46 @@ func Get(key string) error {
 }
 ```
 
+## Why
 
-## Зачем
+This linter is an attempt to bring order to the logs. 
 
-Этот линтер – попытка навести порядок влогах.
+It is often unclear from the logs where the problem occurred. 
 
-По логам часто не понятно где произошла проблема.
+There are already a couple of solutions to this problem, but all have significant drawbacks:
 
-У этой проблемы уже есть есть пара решений, но все имеют существенные недостатки:
+1. Use a logger that annotates entries with the file and line where the log was written. 
 
-1. Использовать логер снабжающий записи указанием на файл и строку где лог был написан.
+    The file and line number can be indicated by the logger, but this will be the place where log.Error was called, 
+    not the place where the error occurred. 
 
-    Файл и номер строки логер указать может, но это будет место где вызвали log.Error, 
-    а не место в котором произошла ошибка.
-    
-    Это значит что ошибки нужно логировать прямо там где они произошли.
-    В итоге логи начинают писать повсюду и с большой избыточностью.
+    This means that errors need to be logged right where they occurred. 
+    As a result, logs start to be written everywhere and with great redundancy. 
 
-    Одна ошибка генерирует несколько похожих сообщений про одну и ту же ошибку 
-    и в каждом сообщении немного свой контекст и чтобы увидеть полный контекст 
-    необходимо собрать все эти записи.
+    One error generates several similar messages about the same error 
+    and each message has a slightly different context and to see the full context, 
+    all these entries need to be collected.
 
-2. Использовать для ошибок сторонние библиотеки типа [pkg/errors](https://github.com/pkg/errors)
+2. Use third-party libraries like [pkg/errors](https://github.com/pkg/errors) for errors. 
 
-    Есть множество библиотек которые сохраянют стек вызовов при создания ошибки.
+    There are many libraries that save the call stack when creating an error. 
 
-    Это не плохой подход, но есть ряд минусов:
-    - повсюду нужно использовать одну определенную библиотеку для ошибок
-    - плохо сочетается с нативным [врапингом через %w](https://go.dev/blog/go1.13-errors)
+    This is not a bad approach, but there are a number of downsides:
+    - everywhere you need to use one specific library for errors
+    - poorly combined with native [wrapping through %w](https://go.dev/blog/go1.13-errors)
 
 
-На данный момент оптимальным компромисом кажется идти идиоматическим путем принятым 
-в стандартной библиотеке:
+At the moment, the optimal compromise seems to be to go the idiomatic way accepted in the standard library:
 
-Примеры ошибок из стандартной библиотеки:
+Examples of errors from the standard library:
+
 - strconv.Atoi: parsing "x": invalid syntax
 - plugin.Open("file.so"): realpath failed
 - bytes.Buffer: too large
 - open file.go: no such file or directory
 - strings.Builder.Grow: negative count
 
-Видно что строгой схемы нет, но паттерн прослеживается: вначале имя пакета/метода/функции, затем двоеточие и далее подробности.
+It can be seen that there is no strict scheme, but a pattern can be traced: first the name of the package/method/function, then a colon and further details.
 
 ```go
 package pkg
@@ -74,28 +74,27 @@ func Get(key string) error {
 }
 ```
 
-`pkg.Get("abc")` дает ошибку: 
+`pkg.Get("abc")` gives an error:
 ```
 pkg.Get: strconv.Atoi: parsing "abc": invalid syntax; key=abc
 ```
 
-У такого подхода ряд плюсов:
+This approach has several advantages:
 
-- Хорошо стыкуется с ошибками стандартной библиотеки
+- Well aligned with standard library errors
 
-- Дружит с врапингом
+- Compatible with wrapping
 
-- Писать текст ошибки проще:
+- Writing error text is easier:
 
   `failed to get package cause key abc is not valid ...` vs `pkg.Get: strconv.Atoi: parsing "abc": invalid syntax`.
-  
-  Второй вариант инженеру проще и читать и писать.
 
-- Логи удобно грепать
+  The second option is easier for an engineer to read and write.
+
+- Logs are easy to grep
 
 
-А главный минус подхода в том что нужно следить за согласованностью имени пакета/функции 
-и текста ошибок/логов, ведь при переименовании функции нужно не забыть поменять 
-все ошибки/логи. 
+The main disadvantage of the approach is that you need to monitor the consistency of the package/function name 
+and error/log text, because when renaming a function, you need to remember to change all errors/logs.
 
-Именнно эту проблему и решает этот линтер.
+This is the problem that this linter solves.
